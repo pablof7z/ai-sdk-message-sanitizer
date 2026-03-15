@@ -1,0 +1,10 @@
+{
+  "name": "ai-sdk-message-sanitizer-examples",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "ai": "^6.0.116",
+    "@ai-sdk/provider": "^3.0.8",
+    "ai-sdk-message-sanitizer": "file:.."
+  }
+}
