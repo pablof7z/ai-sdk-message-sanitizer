@@ -21,6 +21,14 @@ interface SanitizationWarning {
     removed: Array<{ index: number; role: string }>;
 }
 
+interface ToolInputRepair {
+    messageIndex: number;
+    partIndex: number;
+    toolCallId?: string;
+    toolName: string;
+    inputType: string;
+}
+
 interface ToolOrderingIssue {
     assistantBlockStart: number;
     nextBlockStart: number | null;
@@ -93,6 +101,100 @@ function hasToolCallContent(msg: LanguageModelV3Message): boolean {
 function hasEmptyContent(msg: LanguageModelV3Message): boolean {
     if (msg.role === "system" || msg.role === "tool") return false;
     return Array.isArray(msg.content) && msg.content.length === 0;
+}
+
+function isDictionary(value: unknown): value is Record<string, unknown> {
+    return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function describeInputType(value: unknown): string {
+    if (value === null) return "null";
+    if (Array.isArray(value)) return "array";
+    return typeof value;
+}
+
+function serializeInvalidInput(value: unknown): string {
+    if (typeof value === "string") return value;
+    if (value === undefined) return "";
+    try {
+        return JSON.stringify(value);
+    } catch {
+        return String(value);
+    }
+}
+
+function wrapInvalidToolInput(value: unknown): Record<string, unknown> {
+    if (value === undefined || value === null) {
+        return {};
+    }
+
+    return {
+        _sanitizerInvalidInput: true,
+        _sanitizerOriginalInputType: describeInputType(value),
+        rawInput: serializeInvalidInput(value),
+    };
+}
+
+function sanitizeToolCallInputs(
+    prompt: LanguageModelV3Message[]
+): { result: LanguageModelV3Message[]; repairs: ToolInputRepair[] } {
+    const repairs: ToolInputRepair[] = [];
+    let changed = false;
+
+    const result = prompt.map((message, messageIndex) => {
+        if (message.role !== "assistant" || !Array.isArray(message.content)) {
+            return message;
+        }
+
+        let messageChanged = false;
+        const content = message.content.map((part, partIndex) => {
+            if (
+                typeof part !== "object" ||
+                part === null ||
+                !("type" in part) ||
+                part.type !== "tool-call"
+            ) {
+                return part;
+            }
+
+            const input = "input" in part ? part.input : undefined;
+            if (isDictionary(input)) {
+                return part;
+            }
+
+            changed = true;
+            messageChanged = true;
+            repairs.push({
+                messageIndex,
+                partIndex,
+                toolCallId:
+                    "toolCallId" in part && typeof part.toolCallId === "string"
+                        ? part.toolCallId
+                        : undefined,
+                toolName:
+                    "toolName" in part && typeof part.toolName === "string"
+                        ? part.toolName
+                        : "unknown",
+                inputType: describeInputType(input),
+            });
+
+            return {
+                ...part,
+                input: wrapInvalidToolInput(input),
+            };
+        }) as typeof message.content;
+
+        if (!messageChanged) {
+            return message;
+        }
+
+        return {
+            ...message,
+            content,
+        };
+    });
+
+    return changed ? { result, repairs } : { result: prompt, repairs };
 }
 
 function detectToolOrderingIssues(prompt: LanguageModelV3Message[]): ToolOrderingIssue[] {
@@ -326,6 +428,7 @@ async function getActiveSpan() {
  * Creates a message sanitizer middleware that runs before every LLM API call.
  *
  * Fixes message array problems that would cause API rejection:
+ * - Assistant tool calls whose input is not a JSON object/dictionary
  * - Trailing assistant messages without tool calls (Anthropic rejects these)
  * - Empty-content user/assistant messages
  * - Misplaced tool results (tool ordering repair)
@@ -344,7 +447,10 @@ export function createMessageSanitizerMiddleware(options: MessageSanitizerOption
             const originalPrompt = params.prompt as LanguageModelV3Message[];
             const originalCount = originalPrompt.length;
 
-            const { result: sanitized, warnings } = sanitize(originalPrompt);
+            const { result: toolInputSanitized, repairs: toolInputRepairs } =
+                sanitizeToolCallInputs(originalPrompt);
+
+            const { result: sanitized, warnings } = sanitize(toolInputSanitized);
 
             const toolOrderingIssues = detectToolOrderingIssues(sanitized);
 
@@ -352,13 +458,33 @@ export function createMessageSanitizerMiddleware(options: MessageSanitizerOption
                 ? repairToolOrdering(sanitized)
                 : { result: sanitized, repairs: [] as ToolOrderingRepair[] };
 
-            if (warnings.length === 0 && toolOrderingIssues.length === 0) {
+            if (
+                toolInputRepairs.length === 0 &&
+                warnings.length === 0 &&
+                toolOrderingIssues.length === 0
+            ) {
                 return params;
             }
 
             const modelId = `${model.provider}:${model.modelId}`;
             const allRemoved = warnings.flatMap((w) => w.removed);
             const finalPrompt = repairs.length > 0 ? repaired : sanitized;
+
+            for (const repair of toolInputRepairs) {
+                options.onFix?.({
+                    ts: new Date().toISOString(),
+                    fix: "tool-call-input-wrapped",
+                    model: modelId,
+                    callType: type,
+                    original_count: originalCount,
+                    fixed_count: finalPrompt.length,
+                    message_index: repair.messageIndex,
+                    part_index: repair.partIndex,
+                    tool_call_id: repair.toolCallId,
+                    tool_name: repair.toolName,
+                    input_type: repair.inputType,
+                });
+            }
 
             for (const warning of warnings) {
                 options.onFix?.({
@@ -402,13 +528,38 @@ export function createMessageSanitizerMiddleware(options: MessageSanitizerOption
 
             const span = await getActiveSpan();
             if (span) {
-                if (warnings.length > 0) {
+                if (toolInputRepairs.length > 0 || warnings.length > 0) {
                     span.addEvent("message-sanitizer.fix-applied", {
-                        "sanitizer.fixes": warnings.map((w) => w.fix).join(","),
+                        "sanitizer.fixes": Array.from(
+                            new Set([
+                                ...toolInputRepairs.map(() => "tool-call-input-wrapped"),
+                                ...warnings.map((w) => w.fix),
+                            ])
+                        ).join(","),
                         "sanitizer.original_count": originalCount,
                         "sanitizer.fixed_count": finalPrompt.length,
                         "sanitizer.removed_indices": allRemoved.map((r) => r.index).join(","),
                         "sanitizer.removed_roles": allRemoved.map((r) => r.role).join(","),
+                        "sanitizer.tool_input_repairs_count": toolInputRepairs.length,
+                        "sanitizer.repaired_tool_call_ids": toolInputRepairs
+                            .map((repair) => repair.toolCallId ?? "")
+                            .filter(Boolean)
+                            .join(","),
+                        "sanitizer.model": modelId,
+                        "sanitizer.call_type": type,
+                    });
+                }
+
+                if (toolInputRepairs.length > 0) {
+                    span.addEvent("message-sanitizer.tool-call-input-wrapped", {
+                        "sanitizer.repairs_count": toolInputRepairs.length,
+                        "sanitizer.repaired_tool_call_ids": toolInputRepairs
+                            .map((repair) => repair.toolCallId ?? "")
+                            .filter(Boolean)
+                            .join(","),
+                        "sanitizer.input_types": Array.from(
+                            new Set(toolInputRepairs.map((repair) => repair.inputType))
+                        ).join(","),
                         "sanitizer.model": modelId,
                         "sanitizer.call_type": type,
                     });
@@ -438,7 +589,11 @@ export function createMessageSanitizerMiddleware(options: MessageSanitizerOption
                 }
             }
 
-            if (warnings.length === 0 && repairs.length === 0) {
+            if (
+                toolInputRepairs.length === 0 &&
+                warnings.length === 0 &&
+                repairs.length === 0
+            ) {
                 return params;
             }
 

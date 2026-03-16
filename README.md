@@ -2,7 +2,7 @@
 
 AI SDK middleware that fixes malformed message arrays before they reach the LLM provider.
 
-Some APIs (Anthropic in particular) reject calls with trailing assistant messages, empty content arrays, or tool results that appear out of order. These conditions arise naturally from context management, multi-step agents, and streaming — and they produce cryptic 400 errors. This middleware fixes them silently before the call goes out.
+Some APIs (Anthropic in particular) reject calls with trailing assistant messages, empty content arrays, malformed assistant tool-call inputs, or tool results that appear out of order. These conditions arise naturally from context management, multi-step agents, and streaming — and they produce cryptic 400 errors. This middleware fixes them silently before the call goes out.
 
 ## Installation
 
@@ -27,6 +27,17 @@ const model = wrapLanguageModel({
 That's it. Wrap the model and all calls through it are sanitized transparently.
 
 ## What It Fixes
+
+### Malformed assistant tool-call inputs
+
+Providers expect assistant `tool-call` parts to carry an object/dictionary `input`. In real agent traces, malformed tool calls sometimes survive into replayed history as strings, arrays, or other non-object payloads, which causes provider-side 400s on the next turn.
+
+```
+Before: [assistant: tool-call(input: "<parameter ...>")]
+After:  [assistant: tool-call(input: { rawInput: "<parameter ...>", ... })]
+```
+
+The sanitizer wraps non-object inputs into a valid object so the prompt remains replayable, while preserving the raw malformed payload for debugging.
 
 ### Trailing assistant messages
 
@@ -102,6 +113,7 @@ Fix types:
 
 | `fix` value | Triggered when |
 |---|---|
+| `tool-call-input-wrapped` | One or more assistant tool calls had non-object `input` and were wrapped into a valid dictionary |
 | `empty-content-stripped` | One or more user/assistant messages had `content: []` |
 | `trailing-assistant-stripped` | One or more trailing assistant messages had no tool calls |
 | `invalid-tool-order-detected` | An assistant block's tool results appeared too late (diagnostic only) |
@@ -115,7 +127,8 @@ When `@opentelemetry/api` is installed and an active span exists, the middleware
 
 | Event | Attributes |
 |---|---|
-| `message-sanitizer.fix-applied` | fixes, original/fixed count, removed indices and roles, model, call type |
+| `message-sanitizer.fix-applied` | fixes, original/fixed count, removed indices and roles, wrapped tool-call count, model, call type |
+| `message-sanitizer.tool-call-input-wrapped` | repairs count, repaired tool call IDs, input types, model, call type |
 | `message-sanitizer.invalid-tool-order-detected` | issue count, block starts, missing tool call IDs, model, call type |
 | `message-sanitizer.tool-ordering-repaired` | repairs count, repaired tool call IDs, model, call type |
 

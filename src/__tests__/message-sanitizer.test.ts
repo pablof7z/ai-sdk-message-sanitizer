@@ -261,6 +261,50 @@ describe("message-sanitizer middleware", () => {
         });
     });
 
+    describe("assistant tool-call inputs", () => {
+        test("wraps malformed tool-call input into a dictionary", async () => {
+            const prompt: LanguageModelV3Message[] = [
+                {
+                    role: "assistant",
+                    content: [{
+                        type: "tool-call",
+                        toolCallId: "call-1",
+                        toolName: "scratchpad",
+                        input: "{\"setEntries\": \n<parameter name=\"objective\">debug it</parameter>",
+                    }],
+                },
+                {
+                    role: "tool",
+                    content: [{
+                        type: "tool-result",
+                        toolCallId: "call-1",
+                        toolName: "scratchpad",
+                        output: { type: "text", value: "Tool execution failed" },
+                    }],
+                },
+                { role: "user", content: [{ type: "text", text: "Continue" }] },
+            ];
+
+            const params = makeParams(prompt);
+            const result = await transformParams({
+                params,
+                type: "stream",
+                model: fakeModel,
+            });
+
+            expect(result).not.toBe(params);
+
+            const toolCallPart = (
+                result.prompt[0] as { content: Array<Record<string, unknown>> }
+            ).content[0];
+            expect(toolCallPart.input).toEqual({
+                _sanitizerInvalidInput: true,
+                _sanitizerOriginalInputType: "string",
+                rawInput: "{\"setEntries\": \n<parameter name=\"objective\">debug it</parameter>",
+            });
+        });
+    });
+
     describe("onFix callback", () => {
         test("calls onFix with structured entry when fix is applied", async () => {
             const prompt: LanguageModelV3Message[] = [
@@ -364,6 +408,46 @@ describe("message-sanitizer middleware", () => {
             expect(diagnosticEntry!.resolved_tool_call_ids).toEqual(["call-a"]);
             expect(diagnosticEntry!.missing_tool_call_ids).toEqual(["call-b"]);
             expect(diagnosticEntry!.next_block_role).toBe("user");
+        });
+
+        test("calls onFix when tool-call input is wrapped", async () => {
+            const prompt: LanguageModelV3Message[] = [
+                {
+                    role: "assistant",
+                    content: [{
+                        type: "tool-call",
+                        toolCallId: "call-1",
+                        toolName: "scratchpad",
+                        input: "{\"setEntries\": \n<parameter name=\"objective\">debug it</parameter>",
+                    }],
+                },
+                {
+                    role: "tool",
+                    content: [{
+                        type: "tool-result",
+                        toolCallId: "call-1",
+                        toolName: "scratchpad",
+                        output: { type: "text", value: "Tool execution failed" },
+                    }],
+                },
+                { role: "user", content: [{ type: "text", text: "Continue" }] },
+            ];
+
+            await transformParams({
+                params: makeParams(prompt),
+                type: "stream",
+                model: fakeModel,
+            });
+
+            const fixEntry = fixEntries.find((entry) => entry.fix === "tool-call-input-wrapped");
+            expect(fixEntry).toBeDefined();
+            expect(fixEntry!.model).toBe("anthropic:claude-opus-4-6");
+            expect(fixEntry!.callType).toBe("stream");
+            expect(fixEntry!.tool_call_id).toBe("call-1");
+            expect(fixEntry!.tool_name).toBe("scratchpad");
+            expect(fixEntry!.input_type).toBe("string");
+            expect(fixEntry!.original_count).toBe(3);
+            expect(fixEntry!.fixed_count).toBe(3);
         });
 
         test("works without onFix callback (no crash)", async () => {
@@ -482,6 +566,46 @@ describe("message-sanitizer middleware", () => {
             expect(attrs["sanitizer.issue_count"]).toBe(1);
             expect(attrs["sanitizer.issue_block_starts"]).toBe("1");
             expect(attrs["sanitizer.missing_tool_call_ids"]).toBe("call-b");
+        });
+
+        test("adds a span event when tool-call input is wrapped", async () => {
+            const prompt: LanguageModelV3Message[] = [
+                {
+                    role: "assistant",
+                    content: [{
+                        type: "tool-call",
+                        toolCallId: "call-1",
+                        toolName: "scratchpad",
+                        input: "{\"setEntries\": \n<parameter name=\"objective\">debug it</parameter>",
+                    }],
+                },
+                {
+                    role: "tool",
+                    content: [{
+                        type: "tool-result",
+                        toolCallId: "call-1",
+                        toolName: "scratchpad",
+                        output: { type: "text", value: "Tool execution failed" },
+                    }],
+                },
+                { role: "user", content: [{ type: "text", text: "Continue" }] },
+            ];
+
+            await transformParams({
+                params: makeParams(prompt),
+                type: "stream",
+                model: fakeModel,
+            });
+
+            const repairEvents = spanEvents.filter(
+                (e) => e.name === "message-sanitizer.tool-call-input-wrapped"
+            );
+            expect(repairEvents).toHaveLength(1);
+
+            const attrs = repairEvents[0].attributes!;
+            expect(attrs["sanitizer.repairs_count"]).toBe(1);
+            expect(attrs["sanitizer.repaired_tool_call_ids"]).toBe("call-1");
+            expect(attrs["sanitizer.input_types"]).toBe("string");
         });
     });
 
