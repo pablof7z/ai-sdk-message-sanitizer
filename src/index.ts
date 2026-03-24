@@ -30,6 +30,7 @@ interface ToolInputRepair {
 }
 
 interface ToolOrderingIssue {
+    // Message index of the assistant tool-call message whose results are out of position.
     assistantBlockStart: number;
     nextBlockStart: number | null;
     nextBlockRole: "assistant" | "system" | "user" | "none";
@@ -200,26 +201,18 @@ function sanitizeToolCallInputs(
 function detectToolOrderingIssues(prompt: LanguageModelV3Message[]): ToolOrderingIssue[] {
     const issues: ToolOrderingIssue[] = [];
 
-    for (let i = 0; i < prompt.length;) {
-        const blockStart = i;
-        const blockRole = getMessageBlockRole(prompt[i]);
-        const blockMessages: LanguageModelV3Message[] = [];
-
-        while (i < prompt.length && getMessageBlockRole(prompt[i]) === blockRole) {
-            blockMessages.push(prompt[i]);
-            i++;
-        }
-
-        if (blockRole !== "assistant") {
+    for (let i = 0; i < prompt.length; i++) {
+        const message = prompt[i];
+        if (message.role !== "assistant") {
             continue;
         }
 
-        const toolCallIds = Array.from(new Set(blockMessages.flatMap(getToolCallIds)));
+        const toolCallIds = Array.from(new Set(getToolCallIds(message)));
         if (toolCallIds.length === 0) {
             continue;
         }
 
-        const nextBlockStart = i < prompt.length ? i : null;
+        const nextBlockStart = i + 1 < prompt.length ? i + 1 : null;
         const nextBlockRole = nextBlockStart !== null
             ? getMessageBlockRole(prompt[nextBlockStart])
             : "none";
@@ -242,7 +235,7 @@ function detectToolOrderingIssues(prompt: LanguageModelV3Message[]): ToolOrderin
         }
 
         issues.push({
-            assistantBlockStart: blockStart,
+            assistantBlockStart: i,
             nextBlockStart,
             nextBlockRole,
             toolCallIds,
@@ -254,13 +247,34 @@ function detectToolOrderingIssues(prompt: LanguageModelV3Message[]): ToolOrderin
     return issues;
 }
 
+function findToolResultLocation(
+    messages: LanguageModelV3Message[],
+    toolCallId: string
+): { messageIndex: number; partIndex: number } | null {
+    for (let i = 0; i < messages.length; i++) {
+        const msg = messages[i];
+        if (msg.role !== "tool" || !Array.isArray(msg.content)) {
+            continue;
+        }
+
+        const partIndex = (msg.content as Array<{ type?: string; toolCallId?: string }>).findIndex(
+            (part) => part.type === "tool-result" && part.toolCallId === toolCallId
+        );
+        if (partIndex !== -1) {
+            return { messageIndex: i, partIndex };
+        }
+    }
+
+    return null;
+}
+
 /**
  * Repair tool ordering issues by relocating misplaced tool results.
  *
- * When an assistant block has tool_use IDs whose tool_result parts appear
- * later in the prompt (not immediately after), this function:
+ * When an assistant tool-call message has tool_use IDs whose tool_result parts
+ * appear later in the prompt (not immediately after), this function:
  * 1. Extracts those result parts from their current positions
- * 2. Inserts them into the user/tool block immediately following the assistant block
+ * 2. Inserts them into the user/tool block immediately following that message
  * 3. Removes empty messages left behind after extraction
  *
  * Processes issues from end-to-start to avoid index shift cascades.
@@ -282,14 +296,6 @@ function repairToolOrdering(prompt: LanguageModelV3Message[]): {
             : msg.content,
     })) as LanguageModelV3Message[];
 
-    // Build index: toolCallId → message index (for tool-result parts)
-    const resultLocationByCallId = new Map<string, number>();
-    for (let i = 0; i < messages.length; i++) {
-        for (const id of getToolResultIds(messages[i])) {
-            resultLocationByCallId.set(id, i);
-        }
-    }
-
     const repairs: ToolOrderingRepair[] = [];
 
     // Process issues from end to start to keep indices stable
@@ -302,24 +308,24 @@ function repairToolOrdering(prompt: LanguageModelV3Message[]): {
         const messageIndicesToClean = new Set<number>();
 
         for (const missingId of issue.missingToolCallIds) {
-            const msgIndex = resultLocationByCallId.get(missingId);
-            if (msgIndex === undefined) continue;
+            const location = findToolResultLocation(messages, missingId);
+            if (!location) continue;
 
-            const msg = messages[msgIndex];
+            const msg = messages[location.messageIndex];
             if (msg.role !== "tool" || !Array.isArray(msg.content)) continue;
 
             const partIndex = (msg.content as Array<{ type?: string; toolCallId?: string }>).findIndex(
                 (part) => part.type === "tool-result" && part.toolCallId === missingId
             );
-            if (partIndex === -1) continue;
+            if (partIndex === -1 || partIndex !== location.partIndex) continue;
 
             collectedParts.push(msg.content[partIndex]);
             (msg.content as unknown[]).splice(partIndex, 1);
-            messageIndicesToClean.add(msgIndex);
+            messageIndicesToClean.add(location.messageIndex);
 
             repairs.push({
                 toolCallId: missingId,
-                fromMessageIndex: msgIndex,
+                fromMessageIndex: location.messageIndex,
                 insertedAfterIndex: issue.nextBlockStart ?? issue.assistantBlockStart + 1,
             });
         }

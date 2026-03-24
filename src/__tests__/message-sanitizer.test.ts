@@ -61,6 +61,13 @@ function getToolCallIdsFromMsg(msg: LanguageModelV3Message): string[] {
         .map((p) => p.toolCallId!);
 }
 
+function getToolResultIdsFromMsg(msg: LanguageModelV3Message): string[] {
+    if (msg.role !== "tool" || !Array.isArray(msg.content)) return [];
+    return (msg.content as Array<{ type: string; toolCallId?: string }>)
+        .filter((p) => p.type === "tool-result" && typeof p.toolCallId === "string")
+        .map((p) => p.toolCallId!);
+}
+
 const fakeModel: LanguageModelV3 = {
     specificationVersion: "v3",
     provider: "anthropic",
@@ -360,7 +367,7 @@ describe("message-sanitizer middleware", () => {
             expect(fixEntries[1].fix).toBe("trailing-assistant-stripped");
         });
 
-        test("calls onFix with diagnostic entry when tool-call ordering is invalid", async () => {
+        test("calls onFix with per-message diagnostic entries when tool-call ordering is invalid", async () => {
             const prompt: LanguageModelV3Message[] = [
                 { role: "user", content: [{ type: "text", text: "Start" }] },
                 {
@@ -402,12 +409,24 @@ describe("message-sanitizer middleware", () => {
                 model: fakeModel,
             });
 
-            const diagnosticEntry = fixEntries.find((e) => e.fix === "invalid-tool-order-detected");
-            expect(diagnosticEntry).toBeDefined();
-            expect(diagnosticEntry!.tool_call_ids).toEqual(["call-a", "call-b"]);
-            expect(diagnosticEntry!.resolved_tool_call_ids).toEqual(["call-a"]);
-            expect(diagnosticEntry!.missing_tool_call_ids).toEqual(["call-b"]);
-            expect(diagnosticEntry!.next_block_role).toBe("user");
+            const diagnosticEntries = fixEntries.filter((e) => e.fix === "invalid-tool-order-detected");
+            expect(diagnosticEntries).toHaveLength(2);
+            expect(diagnosticEntries[0]).toMatchObject({
+                assistant_block_start: 1,
+                next_block_start: 2,
+                next_block_role: "assistant",
+                tool_call_ids: ["call-a"],
+                resolved_tool_call_ids: [],
+                missing_tool_call_ids: ["call-a"],
+            });
+            expect(diagnosticEntries[1]).toMatchObject({
+                assistant_block_start: 2,
+                next_block_start: 3,
+                next_block_role: "user",
+                tool_call_ids: ["call-b"],
+                resolved_tool_call_ids: ["call-a"],
+                missing_tool_call_ids: ["call-b"],
+            });
         });
 
         test("calls onFix when tool-call input is wrapped", async () => {
@@ -555,7 +574,41 @@ describe("message-sanitizer middleware", () => {
                 model: fakeModel,
             });
 
-            expect(result).toBe(params);
+            expect(result).not.toBe(params);
+            expect(result.prompt).toEqual([
+                { role: "user", content: [{ type: "text", text: "Start" }] },
+                {
+                    role: "assistant",
+                    content: [{
+                        type: "tool-call",
+                        toolCallId: "call-a",
+                        toolName: "search",
+                        input: { query: "a" },
+                    }],
+                },
+                {
+                    role: "tool",
+                    content: [{
+                        type: "tool-result",
+                        toolCallId: "call-a",
+                        toolName: "search",
+                        output: { type: "text", value: "result-a" },
+                    }],
+                },
+                {
+                    role: "assistant",
+                    content: [{
+                        type: "tool-call",
+                        toolCallId: "call-b",
+                        toolName: "search",
+                        input: { query: "b" },
+                    }],
+                },
+                {
+                    role: "user",
+                    content: [{ type: "text", text: "Continue" }],
+                },
+            ]);
 
             const diagnosticEvents = spanEvents.filter(
                 (e) => e.name === "message-sanitizer.invalid-tool-order-detected"
@@ -563,9 +616,9 @@ describe("message-sanitizer middleware", () => {
             expect(diagnosticEvents).toHaveLength(1);
 
             const attrs = diagnosticEvents[0].attributes!;
-            expect(attrs["sanitizer.issue_count"]).toBe(1);
-            expect(attrs["sanitizer.issue_block_starts"]).toBe("1");
-            expect(attrs["sanitizer.missing_tool_call_ids"]).toBe("call-b");
+            expect(attrs["sanitizer.issue_count"]).toBe(2);
+            expect(attrs["sanitizer.issue_block_starts"]).toBe("1,2");
+            expect(attrs["sanitizer.missing_tool_call_ids"]).toBe("call-a,call-b");
         });
 
         test("adds a span event when tool-call input is wrapped", async () => {
@@ -650,6 +703,59 @@ describe("message-sanitizer middleware", () => {
     });
 
     describe("tool ordering repair", () => {
+        test("reorders consecutive assistant tool calls so each result follows its matching call", async () => {
+            const prompt: LanguageModelV3Message[] = [
+                { role: "user", content: [{ type: "text", text: "Start" }] },
+                {
+                    role: "assistant",
+                    content: [{ type: "tool-call", toolCallId: "call-1", toolName: "fs_read", input: {} }],
+                },
+                {
+                    role: "assistant",
+                    content: [{ type: "tool-call", toolCallId: "call-2", toolName: "fs_read", input: {} }],
+                },
+                {
+                    role: "assistant",
+                    content: [{ type: "tool-call", toolCallId: "call-3", toolName: "fs_read", input: {} }],
+                },
+                {
+                    role: "tool",
+                    content: [{ type: "tool-result", toolCallId: "call-1", toolName: "fs_read", output: { type: "text", value: "result-1" } }],
+                },
+                {
+                    role: "tool",
+                    content: [{ type: "tool-result", toolCallId: "call-2", toolName: "fs_read", output: { type: "text", value: "result-2" } }],
+                },
+                {
+                    role: "tool",
+                    content: [{ type: "tool-result", toolCallId: "call-3", toolName: "fs_read", output: { type: "text", value: "result-3" } }],
+                },
+            ];
+
+            const result = await transformParams({
+                params: makeParams(prompt),
+                type: "stream",
+                model: fakeModel,
+            });
+
+            const resultPrompt = result.prompt as LanguageModelV3Message[];
+            expect(resultPrompt.map((message) => message.role)).toEqual([
+                "user",
+                "assistant",
+                "tool",
+                "assistant",
+                "tool",
+                "assistant",
+                "tool",
+            ]);
+            expect(getToolCallIdsFromMsg(resultPrompt[1])).toEqual(["call-1"]);
+            expect(getToolResultIdsFromMsg(resultPrompt[2])).toEqual(["call-1"]);
+            expect(getToolCallIdsFromMsg(resultPrompt[3])).toEqual(["call-2"]);
+            expect(getToolResultIdsFromMsg(resultPrompt[4])).toEqual(["call-2"]);
+            expect(getToolCallIdsFromMsg(resultPrompt[5])).toEqual(["call-3"]);
+            expect(getToolResultIdsFromMsg(resultPrompt[6])).toEqual(["call-3"]);
+        });
+
         test("relocates misplaced tool results to the correct position", async () => {
             const prompt: LanguageModelV3Message[] = [
                 { role: "user", content: [{ type: "text", text: "Start" }] },

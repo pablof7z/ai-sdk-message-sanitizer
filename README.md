@@ -79,6 +79,26 @@ After:
   [tool: result-D]
 ```
 
+It also repairs the stricter singleton shape that Anthropic rejects:
+
+```
+Before:
+  [assistant: call-A]
+  [assistant: call-B]
+  [assistant: call-C]
+  [tool: result-A]
+  [tool: result-B]
+  [tool: result-C]
+
+After:
+  [assistant: call-A]
+  [tool: result-A]
+  [assistant: call-B]
+  [tool: result-B]
+  [assistant: call-C]
+  [tool: result-C]
+```
+
 ## Options
 
 ```ts
@@ -116,7 +136,7 @@ Fix types:
 | `tool-call-input-wrapped` | One or more assistant tool calls had non-object `input` and were wrapped into a valid dictionary |
 | `empty-content-stripped` | One or more user/assistant messages had `content: []` |
 | `trailing-assistant-stripped` | One or more trailing assistant messages had no tool calls |
-| `invalid-tool-order-detected` | An assistant block's tool results appeared too late (diagnostic only) |
+| `invalid-tool-order-detected` | An assistant tool-call message's tool results appeared too late (diagnostic only) |
 | `tool-ordering-repaired` | Tool results were successfully relocated to the correct position |
 
 `invalid-tool-order-detected` fires even when repair isn't possible (e.g. the result doesn't exist anywhere in the prompt). It is a diagnostic entry, not a repair confirmation.
