@@ -133,7 +133,7 @@ describe("message-sanitizer middleware", () => {
             expect(result.prompt[0].role).toBe("user");
         });
 
-        test("preserves trailing assistant tool-call messages", async () => {
+        test("strips trailing assistant tool-call messages when no result exists", async () => {
             const prompt: LanguageModelV3Message[] = [
                 { role: "user", content: [{ type: "text", text: "Use a tool" }] },
                 {
@@ -154,8 +154,11 @@ describe("message-sanitizer middleware", () => {
                 model: fakeModel,
             });
 
-            expect(result).toBe(params);
-            expect(result.prompt).toEqual(prompt);
+            expect(result).not.toBe(params);
+            expect(result.prompt).toEqual([
+                { role: "user", content: [{ type: "text", text: "Use a tool" }] },
+            ]);
+            expect(fixEntries.some((e) => e.fix === "unresolved-tool-call-stripped")).toBe(true);
         });
 
         test("does not strip non-trailing assistant messages", async () => {
@@ -596,15 +599,6 @@ describe("message-sanitizer middleware", () => {
                     }],
                 },
                 {
-                    role: "assistant",
-                    content: [{
-                        type: "tool-call",
-                        toolCallId: "call-b",
-                        toolName: "search",
-                        input: { query: "b" },
-                    }],
-                },
-                {
                     role: "user",
                     content: [{ type: "text", text: "Continue" }],
                 },
@@ -911,10 +905,61 @@ describe("message-sanitizer middleware", () => {
                 model: fakeModel,
             });
 
-            expect(result).toBe(params);
+            expect(result).not.toBe(params);
+            expect(result.prompt).toEqual([
+                { role: "user", content: [{ type: "text", text: "Start" }] },
+                {
+                    role: "assistant",
+                    content: [
+                        { type: "tool-call", toolCallId: "call-a", toolName: "search", input: {} },
+                    ],
+                },
+                {
+                    role: "tool",
+                    content: [
+                        { type: "tool-result", toolCallId: "call-a", toolName: "search", output: { type: "text", value: "a" } },
+                    ],
+                },
+                { role: "user", content: [{ type: "text", text: "Continue" }] },
+            ]);
 
             expect(fixEntries.some((e) => e.fix === "invalid-tool-order-detected")).toBe(true);
             expect(fixEntries.some((e) => e.fix === "tool-ordering-repaired")).toBe(false);
+            const stripEntry = fixEntries.find((e) => e.fix === "unresolved-tool-call-stripped");
+            expect(stripEntry).toBeDefined();
+            expect(stripEntry?.stripped_tool_call_ids).toEqual(["call-b"]);
+
+            const stripEvents = spanEvents.filter(
+                (e) => e.name === "message-sanitizer.unresolved-tool-call-stripped"
+            );
+            expect(stripEvents).toHaveLength(1);
+            expect(stripEvents[0].attributes?.["sanitizer.stripped_tool_call_ids"]).toBe("call-b");
+        });
+
+        test("removes empty assistant messages created by stripping unresolved tool calls", async () => {
+            const prompt: LanguageModelV3Message[] = [
+                { role: "user", content: [{ type: "text", text: "Start" }] },
+                {
+                    role: "assistant",
+                    content: [
+                        { type: "tool-call", toolCallId: "call-a", toolName: "search", input: {} },
+                    ],
+                },
+                { role: "user", content: [{ type: "text", text: "Continue" }] },
+            ];
+
+            const result = await transformParams({
+                params: makeParams(prompt),
+                type: "stream",
+                model: fakeModel,
+            });
+
+            expect(result.prompt).toEqual([
+                { role: "user", content: [{ type: "text", text: "Start" }] },
+                { role: "user", content: [{ type: "text", text: "Continue" }] },
+            ]);
+            expect(fixEntries.some((e) => e.fix === "unresolved-tool-call-stripped")).toBe(true);
+            expect(fixEntries.some((e) => e.fix === "empty-content-stripped")).toBe(true);
         });
 
         test("removes empty tool messages after extracting parts", async () => {

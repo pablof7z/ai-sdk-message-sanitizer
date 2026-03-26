@@ -45,6 +45,12 @@ interface ToolOrderingRepair {
     insertedAfterIndex: number;
 }
 
+interface UnresolvedToolCallStripRepair {
+    toolCallId: string;
+    toolName: string;
+    assistantMessageIndex: number;
+}
+
 function getMessageBlockRole(msg: LanguageModelV3Message): "assistant" | "system" | "user" {
     if (msg.role === "tool" || msg.role === "user") return "user";
     return msg.role;
@@ -268,6 +274,17 @@ function findToolResultLocation(
     return null;
 }
 
+function clonePrompt(prompt: LanguageModelV3Message[]): LanguageModelV3Message[] {
+    return prompt.map((msg) => ({
+        ...msg,
+        content: Array.isArray(msg.content)
+            ? (msg.content as unknown[]).map((part) =>
+                typeof part === "object" && part !== null ? { ...part } : part
+            ) as typeof msg.content
+            : msg.content,
+    })) as LanguageModelV3Message[];
+}
+
 /**
  * Repair tool ordering issues by relocating misplaced tool results.
  *
@@ -286,15 +303,7 @@ function repairToolOrdering(prompt: LanguageModelV3Message[]): {
     const issues = detectToolOrderingIssues(prompt);
     if (issues.length === 0) return { result: prompt, repairs: [] };
 
-    // Deep-clone prompt so mutations are safe
-    const messages = prompt.map((msg) => ({
-        ...msg,
-        content: Array.isArray(msg.content)
-            ? (msg.content as unknown[]).map((part) =>
-                typeof part === "object" && part !== null ? { ...part } : part
-            ) as typeof msg.content
-            : msg.content,
-    })) as LanguageModelV3Message[];
+    const messages = clonePrompt(prompt);
 
     const repairs: ToolOrderingRepair[] = [];
 
@@ -379,6 +388,82 @@ function repairToolOrdering(prompt: LanguageModelV3Message[]): {
 }
 
 /**
+ * Strip assistant tool-call parts that still have no matching tool result after
+ * ordering repair has already run. This is a last-resort fallback: if the result
+ * does not exist anywhere in the prompt, keeping the unmatched tool call would
+ * cause the provider to reject the request outright.
+ */
+function stripUnresolvedToolCalls(
+    prompt: LanguageModelV3Message[],
+    issues: ToolOrderingIssue[] = detectToolOrderingIssues(prompt)
+): {
+    result: LanguageModelV3Message[];
+    repairs: UnresolvedToolCallStripRepair[];
+    warnings: SanitizationWarning[];
+} {
+    if (issues.length === 0) {
+        return { result: prompt, repairs: [], warnings: [] };
+    }
+
+    const missingToolCallIdsByAssistantIndex = new Map<number, Set<string>>();
+    for (const issue of issues) {
+        const missingIds =
+            missingToolCallIdsByAssistantIndex.get(issue.assistantBlockStart) ?? new Set<string>();
+        for (const toolCallId of issue.missingToolCallIds) {
+            missingIds.add(toolCallId);
+        }
+        missingToolCallIdsByAssistantIndex.set(issue.assistantBlockStart, missingIds);
+    }
+
+    const messages = clonePrompt(prompt);
+    const repairs: UnresolvedToolCallStripRepair[] = [];
+
+    for (const [assistantMessageIndex, missingToolCallIds] of missingToolCallIdsByAssistantIndex) {
+        const message = messages[assistantMessageIndex];
+        if (message?.role !== "assistant" || !Array.isArray(message.content)) {
+            continue;
+        }
+
+        const nextContent = [];
+        for (const part of message.content) {
+            if (
+                typeof part === "object" &&
+                part !== null &&
+                "type" in part &&
+                part.type === "tool-call" &&
+                "toolCallId" in part &&
+                typeof part.toolCallId === "string" &&
+                missingToolCallIds.has(part.toolCallId)
+            ) {
+                repairs.push({
+                    toolCallId: part.toolCallId,
+                    toolName:
+                        "toolName" in part && typeof part.toolName === "string"
+                            ? part.toolName
+                            : "unknown",
+                    assistantMessageIndex,
+                });
+                continue;
+            }
+
+            nextContent.push(part);
+        }
+
+        messages[assistantMessageIndex] = {
+            ...message,
+            content: nextContent as typeof message.content,
+        };
+    }
+
+    if (repairs.length === 0) {
+        return { result: prompt, repairs: [], warnings: [] };
+    }
+
+    const { result, warnings } = sanitize(messages);
+    return { result, repairs, warnings };
+}
+
+/**
  * Run all sanitization passes on the original prompt, collecting warnings
  * with indices in the original coordinate space.
  *
@@ -456,7 +541,7 @@ export function createMessageSanitizerMiddleware(options: MessageSanitizerOption
             const { result: toolInputSanitized, repairs: toolInputRepairs } =
                 sanitizeToolCallInputs(originalPrompt);
 
-            const { result: sanitized, warnings } = sanitize(toolInputSanitized);
+            const { result: sanitized, warnings: initialWarnings } = sanitize(toolInputSanitized);
 
             const toolOrderingIssues = detectToolOrderingIssues(sanitized);
 
@@ -464,17 +549,37 @@ export function createMessageSanitizerMiddleware(options: MessageSanitizerOption
                 ? repairToolOrdering(sanitized)
                 : { result: sanitized, repairs: [] as ToolOrderingRepair[] };
 
+            const unresolvedToolOrderingIssues =
+                toolOrderingIssues.length > 0 ? detectToolOrderingIssues(repaired) : [];
+            const {
+                result: stripped,
+                repairs: strippedRepairs,
+                warnings: stripWarnings,
+            } = unresolvedToolOrderingIssues.length > 0
+                ? stripUnresolvedToolCalls(repaired, unresolvedToolOrderingIssues)
+                : {
+                    result: repaired,
+                    repairs: [] as UnresolvedToolCallStripRepair[],
+                    warnings: [] as SanitizationWarning[],
+                };
+            const warnings = [...initialWarnings, ...stripWarnings];
+
             if (
                 toolInputRepairs.length === 0 &&
                 warnings.length === 0 &&
-                toolOrderingIssues.length === 0
+                toolOrderingIssues.length === 0 &&
+                strippedRepairs.length === 0
             ) {
                 return params;
             }
 
             const modelId = `${model.provider}:${model.modelId}`;
             const allRemoved = warnings.flatMap((w) => w.removed);
-            const finalPrompt = repairs.length > 0 ? repaired : sanitized;
+            const finalPrompt = strippedRepairs.length > 0 || stripWarnings.length > 0
+                ? stripped
+                : repairs.length > 0
+                    ? repaired
+                    : sanitized;
 
             for (const repair of toolInputRepairs) {
                 options.onFix?.({
@@ -532,14 +637,38 @@ export function createMessageSanitizerMiddleware(options: MessageSanitizerOption
                 });
             }
 
+            if (strippedRepairs.length > 0) {
+                options.onFix?.({
+                    ts: new Date().toISOString(),
+                    fix: "unresolved-tool-call-stripped",
+                    model: modelId,
+                    callType: type,
+                    original_count: originalCount,
+                    fixed_count: finalPrompt.length,
+                    stripped_count: strippedRepairs.length,
+                    stripped_tool_call_ids: strippedRepairs.map((repair) => repair.toolCallId),
+                    stripped_tool_names: Array.from(
+                        new Set(strippedRepairs.map((repair) => repair.toolName))
+                    ),
+                    assistant_message_indices: Array.from(
+                        new Set(strippedRepairs.map((repair) => repair.assistantMessageIndex))
+                    ),
+                });
+            }
+
             const span = await getActiveSpan();
             if (span) {
-                if (toolInputRepairs.length > 0 || warnings.length > 0) {
+                if (
+                    toolInputRepairs.length > 0 ||
+                    warnings.length > 0 ||
+                    strippedRepairs.length > 0
+                ) {
                     span.addEvent("message-sanitizer.fix-applied", {
                         "sanitizer.fixes": Array.from(
                             new Set([
                                 ...toolInputRepairs.map(() => "tool-call-input-wrapped"),
                                 ...warnings.map((w) => w.fix),
+                                ...strippedRepairs.map(() => "unresolved-tool-call-stripped"),
                             ])
                         ).join(","),
                         "sanitizer.original_count": originalCount,
@@ -565,6 +694,23 @@ export function createMessageSanitizerMiddleware(options: MessageSanitizerOption
                             .join(","),
                         "sanitizer.input_types": Array.from(
                             new Set(toolInputRepairs.map((repair) => repair.inputType))
+                        ).join(","),
+                        "sanitizer.model": modelId,
+                        "sanitizer.call_type": type,
+                    });
+                }
+
+                if (strippedRepairs.length > 0) {
+                    span.addEvent("message-sanitizer.unresolved-tool-call-stripped", {
+                        "sanitizer.repairs_count": strippedRepairs.length,
+                        "sanitizer.stripped_tool_call_ids": strippedRepairs
+                            .map((repair) => repair.toolCallId)
+                            .join(","),
+                        "sanitizer.stripped_tool_names": Array.from(
+                            new Set(strippedRepairs.map((repair) => repair.toolName))
+                        ).join(","),
+                        "sanitizer.assistant_message_indices": Array.from(
+                            new Set(strippedRepairs.map((repair) => repair.assistantMessageIndex))
                         ).join(","),
                         "sanitizer.model": modelId,
                         "sanitizer.call_type": type,
@@ -598,7 +744,8 @@ export function createMessageSanitizerMiddleware(options: MessageSanitizerOption
             if (
                 toolInputRepairs.length === 0 &&
                 warnings.length === 0 &&
-                repairs.length === 0
+                repairs.length === 0 &&
+                strippedRepairs.length === 0
             ) {
                 return params;
             }

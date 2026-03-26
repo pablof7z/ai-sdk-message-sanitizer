@@ -99,6 +99,8 @@ After:
   [tool: result-C]
 ```
 
+If a tool result is missing entirely, the sanitizer now strips only the unmatched `tool-call` part instead of forwarding a prompt that the provider will reject. Any surviving assistant text stays in place, and the normal cleanup pass removes assistant messages that become empty or newly invalid after stripping.
+
 ## Options
 
 ```ts
@@ -138,8 +140,9 @@ Fix types:
 | `trailing-assistant-stripped` | One or more trailing assistant messages had no tool calls |
 | `invalid-tool-order-detected` | An assistant tool-call message's tool results appeared too late (diagnostic only) |
 | `tool-ordering-repaired` | Tool results were successfully relocated to the correct position |
+| `unresolved-tool-call-stripped` | One or more assistant tool calls had no matching tool result anywhere in the prompt, so the unmatched tool-call parts were removed |
 
-`invalid-tool-order-detected` fires even when repair isn't possible (e.g. the result doesn't exist anywhere in the prompt). It is a diagnostic entry, not a repair confirmation.
+`invalid-tool-order-detected` fires even when repair isn't possible. When a result is missing entirely, the sanitizer follows that diagnostic with `unresolved-tool-call-stripped` so the prompt can still be sent.
 
 ## OpenTelemetry
 
@@ -151,6 +154,7 @@ When `@opentelemetry/api` is installed and an active span exists, the middleware
 | `message-sanitizer.tool-call-input-wrapped` | repairs count, repaired tool call IDs, input types, model, call type |
 | `message-sanitizer.invalid-tool-order-detected` | issue count, block starts, missing tool call IDs, model, call type |
 | `message-sanitizer.tool-ordering-repaired` | repairs count, repaired tool call IDs, model, call type |
+| `message-sanitizer.unresolved-tool-call-stripped` | stripped count, stripped tool call IDs/names, assistant message indices, model, call type |
 
 OTel is optional — if the package is not installed, the middleware runs without it.
 
